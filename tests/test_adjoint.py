@@ -7,12 +7,14 @@ from examples.seismic import demo_model, Receiver
 from examples.seismic.acoustic import acoustic_setup
 from examples.seismic.tti import tti_setup
 from examples.seismic.viscoacoustic import viscoacoustic_setup
+from examples.seismic.elastic import elastic_setup
 
 presets = {
     'constant': {'preset': 'constant-isotropic'},
     'layers': {'preset': 'layers-isotropic', 'nlayers': 2},
     'layers-tti': {'preset': 'layers-tti', 'nlayers': 2},
     'layers-viscoacoustic': {'preset': 'layers-viscoacoustic', 'nlayers': 2},
+    'layers-elastic': {'preset': 'layers-elastic', 'nlayers': 2},
 }
 
 
@@ -81,6 +83,8 @@ class TestAdjoint(object):
             viscoacoustic_setup),
         ('layers-viscoacoustic', (20, 25, 20), 'maxwell', 2, 2, \
             viscoacoustic_setup),
+        # 2D tests with varying time and space orders
+        ('layers-elastic', (60, 70), None, 8, 1, elastic_setup),
     ])
     def test_adjoint_F(self, mkey, shape, kernel, space_order, time_order, setup_func):
         """
@@ -104,8 +108,12 @@ class TestAdjoint(object):
                         coordinates=solver.geometry.src_positions)
 
         # Run forward and adjoint operators
-        rec = solver.forward(save=False)[0]
-        solver.adjoint(rec=rec, srca=srca)
+        if setup_func is elastic_setup:
+            rec = solver.forward(save=False)[2]
+            solver.adjoint(rec=rec, srca=srca)
+        else:
+            rec = solver.forward(save=False)[0]
+            solver.adjoint(rec=rec, srca=srca)
 
         # Adjoint test: Verify <Ax,y> matches  <x, A^Ty> closely
         term1 = np.dot(srca.data.reshape(-1), solver.geometry.src.data)
