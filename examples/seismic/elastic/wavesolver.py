@@ -155,6 +155,6 @@ class ElasticWaveSolver(object):
         kwargs.update(model.physical_params(**kwargs))
 
         # Execute operator and return wavefield and receiver data
-        summary = self.op_adj().apply(srca=srca, rec=rec, dt=kwargs.pop('dt', self.dt),
+        summary = self.op_adj().apply(src=srca, rec=rec, dt=kwargs.pop('dt', self.dt),
                                       **kwargs)
         return srca, u, sig, summary
