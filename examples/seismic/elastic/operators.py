@@ -1,4 +1,4 @@
-from devito import Eq, Operator, VectorTimeFunction, TensorTimeFunction
+from devito import Eq, Operator, Function, VectorTimeFunction, TensorTimeFunction
 from devito import div, grad, diag, solve
 from examples.seismic import PointSource, Receiver
 
@@ -11,11 +11,14 @@ def src_rec(v, tau, model, geometry, forward=True):
     # Source symbol with input wavelet
     src = PointSource(name='src', grid=model.grid, time_range=geometry.time_axis,
                       npoint=geometry.nsrc)
-    rec1 = Receiver(name='rec1', grid=model.grid, time_range=geometry.time_axis,
-                    npoint=geometry.nrec)
-    rec2 = Receiver(name='rec2', grid=model.grid, time_range=geometry.time_axis,
-                    npoint=geometry.nrec)
-    name = "rec3" if forward else "rec"
+    rec_vx = Receiver(name='rec_vx', grid=model.grid, time_range=geometry.time_axis,
+                      npoint=geometry.nrec)
+    rec_vz = Receiver(name='rec_vz', grid=model.grid, time_range=geometry.time_axis,
+                      npoint=geometry.nrec)
+    if model.grid.dim == 3:
+        rec_vy = Receiver(name='rec_vy', grid=model.grid, time_range=geometry.time_axis,
+                          npoint=geometry.nrec)
+    name = "rec_tau" if forward else "rec"
     rec = Receiver(name="%s" % name, grid=model.grid, time_range=geometry.time_axis,
                    npoint=geometry.nrec)
 
@@ -29,13 +32,16 @@ def src_rec(v, tau, model, geometry, forward=True):
             src_yy = src.inject(field=tau[1, 1].forward, expr=src * s)
             src_expr += src_yy
         # Create interpolation expression for receivers
-        rec_term1 = rec1.interpolate(expr=tau[-1, -1])
-        rec_term2 = rec2.interpolate(expr=div(v))
+        rec_term_vx = rec_vx.interpolate(expr=v[0])
+        rec_term_vz = rec_vz.interpolate(expr=v[-1])
         expr = tau[0, 0] + tau[-1, -1]
+        rec_expr = rec_term_vx + rec_term_vz
         if model.grid.dim == 3:
             expr += tau[1, 1]
-        rec_term3 = rec.interpolate(expr=expr)
-        rec_expr = rec_term1 + rec_term2 + rec_term3
+            rec_term_vy = rec_vy.interpolate(expr=v[1])
+            rec_expr += rec_term_vy
+        rec_term_tau = rec.interpolate(expr=expr)
+        rec_expr += rec_term_tau
 
     else:
         # Construct expression to inject receiver values
@@ -167,7 +173,6 @@ def AdjointOperator(model, geometry, space_order=4, **kwargs):
 
     u = VectorTimeFunction(name='u', grid=model.grid, space_order=space_order,
                            time_order=1)
-
     sig = TensorTimeFunction(name='sig', grid=model.grid, space_order=space_order,
                              time_order=1)
 
@@ -178,3 +183,71 @@ def AdjointOperator(model, geometry, space_order=4, **kwargs):
     # Substitute spacing terms to reduce flops
     return Operator(eqn + srcrec, subs=model.spacing_map, name='AdjointElastic',
                     **kwargs)
+
+
+def GradientOperator(model, geometry, space_order=4, save=True, **kwargs):
+    """
+    Construct a gradient operator in an elastic media.
+    Parameters
+    ----------
+    model : Model
+        Object containing the physical parameters.
+    geometry : AcquisitionGeometry
+        Geometry object that contains the source (SparseTimeFunction) and
+        receivers (SparseTimeFunction) and their position.
+    space_order : int, optional
+        Space discretization order.
+    save : int or Buffer, optional
+        Option to store the entire (unrolled) wavefield.
+    """
+    # Gradient symbol and wavefield symbols
+    grad_lam = Function(name='grad_lam', grid=model.grid)
+    grad_mu = Function(name='grad_mu', grid=model.grid)
+    grad_rho = Function(name='grad_rho', grid=model.grid)
+    v = VectorTimeFunction(name='v', grid=model.grid,
+                           save=geometry.nt if save else None,
+                           space_order=space_order, time_order=1)
+    u = VectorTimeFunction(name='u', grid=model.grid, space_order=space_order,
+                           time_order=1)
+    sig = TensorTimeFunction(name='sig', grid=model.grid, space_order=space_order,
+                             time_order=1)
+    rec_vx = Receiver(name='rec_vx', grid=model.grid, time_range=geometry.time_axis,
+                      npoint=geometry.nrec)
+    rec_vz = Receiver(name='rec_vz', grid=model.grid, time_range=geometry.time_axis,
+                      npoint=geometry.nrec)
+    if model.grid.dim == 3:
+        rec_vy = Receiver(name='rec_vy', grid=model.grid, time_range=geometry.time_axis,
+                          npoint=geometry.nrec)
+
+    s = model.grid.time_dim.spacing
+
+    eqn = elastic_stencil(model, u, sig, forward=False)
+
+    expr_sig = sig[0, 0] + sig[-1, -1]
+    if model.grid.dim == 3:
+        expr_sig += sig[1, 1]
+    gradient_lam = Eq(grad_lam, grad_lam - div(v) * expr_sig)
+
+    expr_vsig = v[0].dx * sig[0, 0] + v[1].dy * sig[1, 1]
+    expr_cross = (v[0].dy + v[1].dx) * sig[0, 1]
+    if model.grid.dim == 3:
+        expr_vsig += v[2].dz * sig[2, 2]
+        expr_cross += ((v[0].dz + v[2].dx) * sig[0, 2]) + \
+            ((v[1].dz + v[2].dy) * sig[1, 2])
+
+    gradient_mu = Eq(grad_mu, grad_mu - (2 * expr_vsig + expr_cross))
+
+    gradient_rho = Eq(grad_rho, grad_rho - expr_vsig)
+
+    gradient_update = [gradient_lam, gradient_mu, gradient_rho]
+
+    # Construct expression to inject receiver values
+    rec_term_vx = rec_vx.inject(field=u[0].backward, expr=s*rec_vx)
+    rec_term_vz = rec_vz.inject(field=u[-1].backward, expr=s*rec_vz)
+    rec_expr = rec_term_vx + rec_term_vz
+    if model.grid.dim == 3:
+        rec_expr += rec_vy.inject(field=u[1].backward, expr=s*rec_vy)
+
+    # Substitute spacing terms to reduce flops
+    return Operator(eqn + rec_expr + gradient_update, subs=model.spacing_map,
+                    name='GradientElastic', **kwargs)
