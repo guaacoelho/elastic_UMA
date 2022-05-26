@@ -3,7 +3,7 @@ from devito import Function, VectorTimeFunction, TensorTimeFunction
 from examples.seismic import PointSource
 
 from examples.seismic.elastic.operators import (
-    ForwardOperator, AdjointOperator, GradientOperator
+    ForwardOperator, AdjointOperator, GradientOperator, BornOperator
 )
 
 
@@ -53,6 +53,12 @@ class ElasticWaveSolver(object):
         """Cached operator for gradient runs"""
         return GradientOperator(self.model, save=save, geometry=self.geometry,
                                 space_order=self.space_order, **self._kwargs)
+
+    @memoized_meth
+    def op_born(self):
+        """Cached operator for born runs"""
+        return BornOperator(self.model, save=None, geometry=self.geometry,
+                            space_order=self.space_order, **self._kwargs)
 
     def forward(self, src=None, rec_tau=None, rec_vx=None, rec_vz=None, rec_vy=None,
                 v=None, tau=None, model=None, save=None, **kwargs):
@@ -222,7 +228,7 @@ class ElasticWaveSolver(object):
         kwargs.update({k.name: k for k in sig})
         if self.model.grid.dim == 3:
             kwargs.update({'rec_vy': rec_vy})
-        # kwargs['time_m'] = 0
+        kwargs['time_m'] = 0
 
         model = model or self.model
         # Pick vp and physical parameters from model unless explicitly provided
@@ -233,3 +239,79 @@ class ElasticWaveSolver(object):
                                        dt=kwargs.pop('dt', self.dt), **kwargs)
 
         return grad_lam, grad_mu, grad_rho, summary
+
+    def jacobian(self, dlam=None, drho=None, dmu=None, src=None, rec_tau=None,
+                 rec_vx=None, rec_vz=None, rec_vy=None, v=None, dv=None, tau=None,
+                 dtau=None, model=None, **kwargs):
+        """
+        Linearized Born modelling function that creates the necessary
+        data objects for running an adjoint modelling operator.
+
+        Parameters
+        ----------
+        src : SparseTimeFunction or array_like, optional
+            Time series data for the injected source term.
+        rec : SparseTimeFunction or array_like, optional
+            The interpolated receiver data.
+        p : TimeFunction, optional
+            The forward wavefield.
+        P : TimeFunction, optional
+            The linearized wavefield.
+        rp : TimeFunction, optional
+            The computed attenuation memory variable.
+        rP : TimeFunction, optional
+            The computed attenuation memory variable.
+        v : VectorTimeFunction, optional
+            The computed particle velocity.
+        dv : VectorTimeFunction, optional
+            The computed particle velocity.
+        model : Model, optional
+            Object containing the physical parameters.
+        vp : Function or float, optional
+            The time-constant velocity.
+        qp : Function, optional
+            The P-wave quality factor.
+        b : Function, optional
+            The time-constant inverse density.
+        """
+        # Source term is read-only, so re-use the default
+        src = src or self.geometry.src
+        # Create a new receiver object to store the result
+        rec_vx = rec_vx or self.geometry.new_rec(name='rec_vx')
+        rec_vz = rec_vz or self.geometry.new_rec(name='rec_vz')
+        if self.model.grid.dim == 3:
+            rec_vy = rec_vy or self.geometry.new_rec(name='rec_vy')
+            kwargs.update({'rec_vy': rec_vy})
+        rec_tau = rec_tau or self.geometry.new_rec(name='rec_tau')
+
+        dlam = dlam or Function(name='dlam', grid=self.model.grid, space_order=0)
+        drho = drho or Function(name='drho', grid=self.model.grid, space_order=0)
+        dmu = dmu or Function(name='dmu', grid=self.model.grid, space_order=0)
+
+        # Create the forward wavefields u and U if not provided
+        v = v or VectorTimeFunction(name='v', grid=self.model.grid,
+                                    space_order=self.space_order, time_order=1)
+        tau = tau or TensorTimeFunction(name='tau', grid=self.model.grid,
+                                        space_order=self.space_order, time_order=1)
+        dv = dv or VectorTimeFunction(name='dv', grid=self.model.grid,
+                                      space_order=self.space_order, time_order=1)
+        dtau = dtau or TensorTimeFunction(name='dtau', grid=self.model.grid,
+                                          space_order=self.space_order, time_order=1)
+
+        kwargs.update({k.name: k for k in v})
+        kwargs.update({k.name: k for k in tau})
+        kwargs.update({k.name: k for k in dv})
+        kwargs.update({k.name: k for k in dtau})
+
+        model = model or self.model
+        # Pick vp and physical parameters from model unless explicitly provided
+        kwargs.update(model.physical_params(**kwargs))
+
+        # Execute operator and return wavefield and receiver data
+        summary = self.op_born().apply(drho=drho, dlam=dlam, dmu=dmu, src=src,
+                                       rec_tau=rec_tau, rec_vx=rec_vx, rec_vz=rec_vz,
+                                       dt=kwargs.pop('dt', self.dt), **kwargs)
+
+        if self.model.grid.dim == 2:
+            return rec_tau, rec_vx, rec_vz, v, tau, dv, dtau, summary
+        return rec_tau, rec_vx, rec_vz, rec_vy, v, tau, dv, dtau, summary

@@ -1,4 +1,5 @@
-from devito import Eq, Operator, Function, VectorTimeFunction, TensorTimeFunction
+from devito import (Eq, Operator, Function, VectorTimeFunction, TensorTimeFunction,
+                    VectorFunction, TensorFunction)
 from devito import div, grad, diag, solve
 from examples.seismic import PointSource, Receiver
 
@@ -55,10 +56,10 @@ def src_rec(v, tau, model, geometry, forward=True):
         # Create interpolation expression for the adjoint-source
         src_expr = src.interpolate(expr=expr)
 
-    return src_expr + rec_expr
+    return src_expr, rec_expr
 
 
-def elastic_stencil(model, v, tau, forward=True):
+def elastic_stencil(model, v, tau, forward=True, qrho=None, qlam=None, qmu=None):
     """
     Implementation of the viscoacoustic wave-equation from:
     1 - Jose M. Carcione (2015): Wave Fields in Real Media: Wave Propagation
@@ -70,13 +71,22 @@ def elastic_stencil(model, v, tau, forward=True):
     """
     lam, mu, b, damp = model.lam, model.mu, model.b, model.damp
 
+    rho = 1. / b
+
     if forward:
 
-        pde_v = v.dt - b * div(tau)
+        qrho = qrho or VectorFunction(name='qrho', grid=model.grid,
+                                      space_order=v.space_order)
+        qlam = qlam or TensorFunction(name='qlam', grid=model.grid,
+                                      space_order=v.space_order)
+        qmu = qmu or TensorFunction(name='qmu', grid=model.grid,
+                                    space_order=v.space_order)
+
+        pde_v = rho * v.dt - div(tau) - qrho
         u_v = Eq(v.forward, damp * solve(pde_v, v.forward))
 
         pde_tau = tau.dt - lam * diag(div(v.forward)) - mu * \
-            (grad(v.forward) + grad(v.forward).T)
+            (grad(v.forward) + grad(v.forward).T) - qlam - qmu
         u_tau = Eq(tau.forward, damp * solve(pde_tau, tau.forward))
 
         return [u_v, u_tau]
@@ -84,7 +94,6 @@ def elastic_stencil(model, v, tau, forward=True):
     else:
 
         lpmu = lam + 2. * mu
-        rho = 1. / b
 
         pde_vx = rho * v[0].dt.T - (lpmu * tau[0, 0]).dx - (lam * tau[1, 1]).dx - \
             (mu * tau[0, 1]).dy
@@ -149,9 +158,10 @@ def ForwardOperator(model, geometry, space_order=4, save=False, **kwargs):
 
     eqn = elastic_stencil(model, v, tau)
 
-    srcrec = src_rec(v, tau, model, geometry)
+    src_expr, rec_expr = src_rec(v, tau, model, geometry)
 
-    op = Operator(eqn + srcrec, subs=model.spacing_map, name="ForwardElastic", **kwargs)
+    op = Operator(eqn + src_expr + rec_expr, subs=model.spacing_map,
+                  name="ForwardElastic", **kwargs)
     # Substitute spacing terms to reduce flops
     return op
 
@@ -178,11 +188,11 @@ def AdjointOperator(model, geometry, space_order=4, **kwargs):
 
     eqn = elastic_stencil(model, u, sig, forward=False)
 
-    srcrec = src_rec(u, sig, model, geometry, forward=False)
+    src_expr, rec_expr = src_rec(u, sig, model, geometry, forward=False)
 
     # Substitute spacing terms to reduce flops
-    return Operator(eqn + srcrec, subs=model.spacing_map, name='AdjointElastic',
-                    **kwargs)
+    return Operator(eqn + src_expr + rec_expr, subs=model.spacing_map,
+                    name='AdjointElastic', **kwargs)
 
 
 def GradientOperator(model, geometry, space_order=4, save=True, **kwargs):
@@ -220,6 +230,7 @@ def GradientOperator(model, geometry, space_order=4, save=True, **kwargs):
                           npoint=geometry.nrec)
 
     s = model.grid.time_dim.spacing
+    b = model.b
 
     eqn = elastic_stencil(model, u, sig, forward=False)
 
@@ -242,12 +253,61 @@ def GradientOperator(model, geometry, space_order=4, save=True, **kwargs):
     gradient_update = [gradient_lam, gradient_mu, gradient_rho]
 
     # Construct expression to inject receiver values
-    rec_term_vx = rec_vx.inject(field=u[0].backward, expr=s*rec_vx)
-    rec_term_vz = rec_vz.inject(field=u[-1].backward, expr=s*rec_vz)
+    rec_term_vx = rec_vx.inject(field=u[0].backward, expr=s*rec_vx*b)
+    rec_term_vz = rec_vz.inject(field=u[-1].backward, expr=s*rec_vz*b)
     rec_expr = rec_term_vx + rec_term_vz
     if model.grid.dim == 3:
-        rec_expr += rec_vy.inject(field=u[1].backward, expr=s*rec_vy)
+        rec_expr += rec_vy.inject(field=u[1].backward, expr=s*rec_vy*b)
 
     # Substitute spacing terms to reduce flops
     return Operator(eqn + rec_expr + gradient_update, subs=model.spacing_map,
                     name='GradientElastic', **kwargs)
+
+
+def BornOperator(model, geometry, space_order=4, **kwargs):
+    """
+    Construct an Linearized Born operator in an elastic media.
+
+    Parameters
+    ----------
+    model : Model
+        Object containing the physical parameters.
+    geometry : AcquisitionGeometry
+        Geometry object that contains the source (SparseTimeFunction) and
+        receivers (SparseTimeFunction) and their position.
+    space_order : int, optional
+        Space discretization order.
+    kernel : str, optional
+        Type of discretization, centered or shifted.
+    """
+    # Create wavefields and a dm field
+    v = VectorTimeFunction(name='v', grid=model.grid, space_order=space_order,
+                           time_order=1)
+    dv = VectorTimeFunction(name='dv', grid=model.grid, space_order=space_order,
+                            time_order=1)
+    tau = TensorTimeFunction(name='tau', grid=model.grid, space_order=space_order,
+                             time_order=1)
+    dtau = TensorTimeFunction(name='dtau', grid=model.grid, space_order=space_order,
+                              time_order=1)
+    drho = Function(name='drho', grid=model.grid, space_order=0)
+    dlam = Function(name='dlam', grid=model.grid, space_order=0)
+    dmu = Function(name='dmu', grid=model.grid, space_order=0)
+
+    # Equations kernels
+    eqn1 = elastic_stencil(model, v, tau)
+
+    qrho = -drho * v.dt
+    qlam = dlam * diag(div(v))
+    qmu = dmu * (grad(v) + grad(v).T)
+
+    eqn2 = elastic_stencil(model, dv, dtau, qrho=qrho, qlam=qlam, qmu=qmu)
+
+    # Add source term expression for p
+    src_term, _ = src_rec(v, tau, model, geometry)
+
+    # Create receiver interpolation expression from P
+    _, rec_term = src_rec(dv, dtau, model, geometry)
+
+    # Substitute spacing terms to reduce flops
+    return Operator(eqn1 + src_term + rec_term + eqn2, subs=model.spacing_map,
+                    name='BornElastic', **kwargs)
