@@ -85,6 +85,8 @@ class TestAdjoint(object):
             viscoacoustic_setup),
         # 2D tests with varying time and space orders
         ('layers-elastic', (60, 70), None, 8, 1, elastic_setup),
+        # 3D tests with varying time and space orders
+        ('layers-elastic', (60, 70, 80), None, 8, 1, elastic_setup),
     ])
     def test_adjoint_F(self, mkey, shape, kernel, space_order, time_order, setup_func):
         """
@@ -108,12 +110,8 @@ class TestAdjoint(object):
                         coordinates=solver.geometry.src_positions)
 
         # Run forward and adjoint operators
-        if setup_func is elastic_setup:
-            rec = solver.forward(save=False)[2]
-            solver.adjoint(rec=rec, srca=srca)
-        else:
-            rec = solver.forward(save=False)[0]
-            solver.adjoint(rec=rec, srca=srca)
+        rec = solver.forward(save=False)[0]
+        solver.adjoint(rec=rec, srca=srca)
 
         # Adjoint test: Verify <Ax,y> matches  <x, A^Ty> closely
         term1 = np.dot(srca.data.reshape(-1), solver.geometry.src.data)
@@ -232,3 +230,91 @@ class TestAdjoint(object):
         term1 = np.dot(p2.data.reshape(-1), p.data.reshape(-1))
         term2 = np.dot(c.data.reshape(-1), a.data.reshape(-1))
         assert np.isclose((term1-term2) / term1, 0., atol=1.e-6)
+
+    @pytest.mark.parametrize('mkey, shape, param, space_order, setup_func', [
+        # 2D tests with varying time and space orders
+        ('layers-elastic', (60, 70), 'all', 8, elastic_setup),
+        ('layers-elastic', (60, 70), 'lam', 8, elastic_setup),
+        ('layers-elastic', (60, 70), 'rho', 8, elastic_setup),
+        ('layers-elastic', (60, 70), 'mu', 8, elastic_setup),
+        # 3D tests with varying time and space orders
+        ('layers-elastic', (60, 70, 80), 'all', 8, elastic_setup),
+        ('layers-elastic', (60, 70, 80), 'lam', 8, elastic_setup),
+        ('layers-elastic', (60, 70, 80), 'rho', 8, elastic_setup),
+        ('layers-elastic', (60, 70, 80), 'mu', 8, elastic_setup),
+    ])
+    def test_adjoint_J_multi_param(self, mkey, shape, param, space_order, setup_func):
+        """
+        Adjoint test for the FWI Jacobian operator.
+        The Jacobian operator J generates a linearized shot record (measurements)
+        from a model perturbation dm while the adjoint of J generates the FWI gradient
+        from an adjoint source (usually data residual). This test uses the conventional
+        dot test:
+        < Jx, y> = <x ,J^T y>
+        """
+        tn = 500.  # Final time
+        nbl = 10 + space_order / 2
+        spacing = tuple([10.]*len(shape))
+        # Create solver from preset
+        solver = setup_func(shape=shape, spacing=spacing, vp_bottom=2, nbl=nbl, tn=tn,
+                            space_order=space_order, **(presets[mkey]), dtype=np.float64)
+
+        # Create initial model (m0) with a constant velocity throughout
+        model0 = demo_model(**(presets[mkey]), vp_top=1.5, vp_bottom=1.5,
+                            spacing=spacing, space_order=space_order, shape=shape,
+                            nbl=nbl, dtype=np.float64, grid=solver.model.grid)
+
+        drho = Function(name='drho', grid=solver.model.grid, space_order=0)
+        dlam = Function(name='dlam', grid=solver.model.grid, space_order=0)
+        dmu = Function(name='dmu', grid=solver.model.grid, space_order=0)
+
+        if param == 'lam':
+            # Compute initial born perturbation from lam - lam0
+            dlam.data[:] = solver.model.lam.data - model0.lam.data
+            dmu.data[:] = 0
+            drho.data[:] = 0
+        elif param == 'rho':
+            # Compute initial born perturbation from rho - rho0
+            drho.data[:] = (1. / solver.model.b.data) - (1. / model0.b.data)
+            dlam.data[:] = 0
+            dmu.data[:] = 0
+        elif param == 'mu':
+            # Compute initial born perturbation from mu - mu0
+            dmu.data[:] = solver.model.mu.data - model0.mu.data
+            dlam.data[:] = 0
+            drho.data[:] = 0
+        else:
+            dlam.data[:] = solver.model.lam.data - model0.lam.data
+            drho.data[:] = (1. / solver.model.b.data) - (1. / model0.b.data)
+            dmu.data[:] = solver.model.mu.data - model0.mu.data
+
+        if solver.model.grid.dim == 2:
+            _, rec_vx, rec_vz = \
+                solver.jacobian(dlam=dlam, drho=drho, dmu=dmu, model=model0)[0:3]
+        else:
+            _, rec_vx, rec_vz, rec_vy = \
+                solver.jacobian(dlam=dlam, drho=drho, dmu=dmu, model=model0)[0:4]
+
+        # Compute the full bg field(s) & gradient from initial perturbation
+        if solver.model.grid.dim == 2:
+            v0 = solver.forward(save=True, model=model0)[3]
+            im_lam, im_mu, im_rho = \
+                solver.jacobian_adjoint(rec_vx, rec_vz, v0, model=model0)[0:3]
+        else:
+            v0 = solver.forward(save=True, model=model0)[4]
+            im_lam, im_mu, im_rho = \
+                solver.jacobian_adjoint(rec_vx, rec_vz, v0,
+                                        rec_vy=rec_vy, model=model0)[0:3]
+
+        # Adjoint test: Verify <Ax,y> matches  <x, A^Ty> closely
+        term1 = np.dot(im_lam.data.reshape(-1), dlam.data.reshape(-1)) + \
+            np.dot(im_mu.data.reshape(-1), dmu.data.reshape(-1)) + \
+            np.dot(im_rho.data.reshape(-1), drho.data.reshape(-1))
+        if solver.model.grid.dim == 2:
+            term2 = np.linalg.norm(rec_vx.data)**2 + np.linalg.norm(rec_vz.data)**2
+        else:
+            term2 = np.linalg.norm(rec_vx.data)**2 + np.linalg.norm(rec_vz.data)**2 + \
+                + np.linalg.norm(rec_vy.data)**2
+        info('<x, J^Ty>: %f, <Jx,y>: %f, difference: %4.4e, ratio: %f'
+             % (term1, term2, (term1 - term2)/term1, term1 / term2))
+        assert np.isclose((term1 - term2)/term1, 0., atol=1.e-12)
